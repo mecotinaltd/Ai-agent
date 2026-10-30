@@ -22,7 +22,7 @@ set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
 set(GGML_CCACHE OFF CACHE BOOL "" FORCE)
 # CPU features the phone must have. armv8.2-a+dotprod covers almost every phone since 2018.
 # Build with -PllamaArch=armv8-a for very old phones (slower).
-set(GGML_CPU_ARM_ARCH "armv8.2-a+dotprod" CACHE STRING "" )
+set(GGML_CPU_ARM_ARCH "armv8-a" CACHE STRING "" )
 
 include(FetchContent)
 FetchContent_Declare(
