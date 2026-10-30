@@ -13,7 +13,7 @@ class Completion(val text: String, val calls: List<ToolCallOut>)
 
 /** Talks to any OpenAI-compatible chat endpoint with streaming and tools. */
 class AgentClient {
-    private var noTemp = false
+    private val dropped = HashSet<String>()
     @Volatile private var conn: HttpURLConnection? = null
 
     fun cancelRequest() {
@@ -21,15 +21,16 @@ class AgentClient {
     }
 
     fun resetTemperature() {
-        noTemp = false
+        dropped.clear()
     }
 
     suspend fun complete(
         cfg: AgentConfig,
+        system: String,
         messages: List<JSONObject>,
         tools: JSONArray,
         onText: (String) -> Unit,
-    ): Completion = withContext(Dispatchers.IO) { run(cfg, messages, tools, onText) }
+    ): Completion = withContext(Dispatchers.IO) { run(cfg, system, messages, tools, onText) }
 
     private class Acc {
         var id = ""
@@ -37,24 +38,23 @@ class AgentClient {
         val args = StringBuilder()
     }
 
-    private fun run(cfg: AgentConfig, messages: List<JSONObject>, tools: JSONArray, onText: (String) -> Unit): Completion {
+    private fun run(cfg: AgentConfig, system: String, messages: List<JSONObject>, tools: JSONArray, onText: (String) -> Unit): Completion {
         val url = URL(cfg.base.trimEnd('/') + "/chat/completions")
-        val local = url.host == "localhost" || url.host == "10.0.2.2"
+        val local = url.host == "localhost" || url.host == "127.0.0.1" || url.host == "10.0.2.2"
         if (!(url.protocol == "https" || (url.protocol == "http" && local))) {
             throw IOException("The model URL must use https.")
         }
-        val system = JSONObject()
-            .put("role", "system")
-            .put("content", cfg.sys + "\nRepository: " + (if (cfg.repo.isBlank()) "not set" else cfg.repo) + ", branch " + cfg.br + ".")
-        val all = JSONArray().put(system)
+        val sys = JSONObject().put("role", "system").put("content", system)
+        val all = JSONArray().put(sys)
         messages.forEach { all.put(it) }
         val body = JSONObject()
             .put("model", cfg.model)
             .put("stream", true)
             .put("max_tokens", cfg.maxTok)
-            .put("tools", tools)
             .put("messages", all)
-        if (!noTemp) body.put("temperature", cfg.temp)
+        if (tools.length() > 0) body.put("tools", tools)
+        if ("temperature" !in dropped) body.put("temperature", cfg.temp)
+        if ("top_p" !in dropped && cfg.topP < 1.0) body.put("top_p", cfg.topP)
 
         val c = url.openConnection() as HttpURLConnection
         conn = c
@@ -69,10 +69,12 @@ class AgentClient {
             val code = c.responseCode
             if (code == 400) {
                 val t = errorText(c)
-                if (!noTemp && t.contains("temperature", ignoreCase = true)) {
-                    noTemp = true
-                    c.disconnect()
-                    return run(cfg, messages, tools, onText)
+                for (p in listOf("temperature", "top_p")) {
+                    if (p !in dropped && t.contains(p, ignoreCase = true)) {
+                        dropped.add(p)
+                        c.disconnect()
+                        return run(cfg, system, messages, tools, onText)
+                    }
                 }
                 throw IOException("API 400: " + t.take(300))
             }
@@ -93,6 +95,7 @@ class AgentClient {
 
     private fun stream(c: HttpURLConnection, onText: (String) -> Unit): Completion {
         val text = StringBuilder()
+        val reasoning = StringBuilder()
         val calls = mutableListOf<Acc>()
         c.inputStream.bufferedReader().use { r ->
             while (true) {
@@ -106,11 +109,21 @@ class AgentClient {
                     continue
                 }
                 val delta = j.optJSONArray("choices")?.optJSONObject(0)?.optJSONObject("delta") ?: continue
+                // Providers send the reasoning as reasoning_content or reasoning.
+                val rs = when {
+                    !delta.isNull("reasoning_content") -> delta.optString("reasoning_content")
+                    !delta.isNull("reasoning") -> delta.optString("reasoning")
+                    else -> ""
+                }
+                if (rs.isNotEmpty()) {
+                    reasoning.append(rs)
+                    onText(compose(reasoning, text))
+                }
                 if (!delta.isNull("content")) {
                     val piece = delta.optString("content")
                     if (piece.isNotEmpty()) {
                         text.append(piece)
-                        onText(text.toString())
+                        onText(compose(reasoning, text))
                     }
                 }
                 val tcs = delta.optJSONArray("tool_calls") ?: continue
@@ -135,10 +148,17 @@ class AgentClient {
         return Completion(text.toString(), out)
     }
 
+    /** Reasoning goes in <think> tags so the app can show it apart from the answer. */
+    private fun compose(reasoning: StringBuilder, text: StringBuilder): String =
+        if (reasoning.isEmpty()) text.toString()
+        else "<think>" + reasoning + (if (text.isEmpty()) "" else "</think>" + text)
+
     private fun plain(c: HttpURLConnection): Completion {
         val j = JSONObject(c.inputStream.bufferedReader().use { it.readText() })
         val m = j.getJSONArray("choices").getJSONObject(0).getJSONObject("message")
-        val text = if (m.isNull("content")) "" else m.optString("content")
+        val answer = if (m.isNull("content")) "" else m.optString("content")
+        val rs = if (!m.isNull("reasoning_content")) m.optString("reasoning_content") else ""
+        val text = if (rs.isEmpty()) answer else "<think>$rs</think>$answer"
         val tcs = m.optJSONArray("tool_calls") ?: JSONArray()
         val out = mutableListOf<ToolCallOut>()
         for (i in 0 until tcs.length()) {

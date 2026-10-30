@@ -11,7 +11,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.collabcode.app.data.Http
+import com.collabcode.app.terminal.TerminalEngine
 import com.collabcode.app.model.Attachment
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -22,7 +22,6 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
-import java.io.IOException
 
 private val TEXT_EXTENSIONS = listOf(
     "txt", "md", "json", "yaml", "yml", "dart", "js", "ts", "py", "html", "css", "kt", "java",
@@ -34,6 +33,8 @@ class AgentEngine(app: Application) : AndroidViewModel(app) {
     private val cfgStore = AgentConfigStore(app)
     private val chatStore = AgentStore(app)
     private val client = AgentClient()
+    private val localClient = LocalClient(app)
+    private val skills = SkillStore(app)
     private val main = Handler(Looper.getMainLooper())
     private var job: Job? = null
     private var stopRequested = false
@@ -48,14 +49,23 @@ class AgentEngine(app: Application) : AndroidViewModel(app) {
         private set
     var toast by mutableStateOf<String?>(null)
     var settingsRequest by mutableStateOf(0)
-    var repos by mutableStateOf<List<String>>(emptyList())
+    var skillList by mutableStateOf<List<Skill>>(emptyList())
         private set
+    var models by mutableStateOf<List<Pair<String, Long>>>(emptyList())
+        private set
+    var dlName by mutableStateOf<String?>(null)
+        private set
+    var dlFraction by mutableStateOf<Float?>(null)
+        private set
+    private var dlJob: Job? = null
 
     init {
+        BuiltinSkills.seedOnce(app)
         chats.addAll(chatStore.load())
         if (chats.isEmpty()) chats.add(Chat("New chat"))
         cur = chats.first()
-        loadRepos()
+        refreshSkills()
+        refreshModels()
     }
 
     // ---------- chats ----------
@@ -98,13 +108,8 @@ class AgentEngine(app: Application) : AndroidViewModel(app) {
         cfg = next
         cfgStore.save(next)
         client.resetTemperature()
-        loadRepos()
+        refreshModels()
         toast = "Settings saved"
-    }
-
-    fun setRepo(r: String) {
-        cfg = cfg.copy(repo = r.trim())
-        cfgStore.save(cfg)
     }
 
     fun setTheme(t: String) {
@@ -112,31 +117,103 @@ class AgentEngine(app: Application) : AndroidViewModel(app) {
         cfgStore.save(cfg)
     }
 
-    private fun loadRepos() {
-        val token = cfg.gt
-        if (token.isBlank()) return
+    // ---------- skills ----------
+
+    fun refreshSkills() {
+        skillList = skills.all()
+    }
+
+    fun importSkills(uris: List<Uri>) {
         viewModelScope.launch {
-            try {
-                val list = withContext(Dispatchers.IO) { fetchRepos(token) }
-                repos = list
-                if (cfg.repo.isBlank() && list.isNotEmpty()) setRepo(list[0])
-            } catch (e: Exception) {
-                // The list is optional. Typing the name still works.
+            val r = withContext(Dispatchers.IO) { skills.importUris(uris) }
+            refreshSkills()
+            toast = when {
+                r.added.isNotEmpty() && r.problems.isEmpty() -> "Skill added: " + r.added.joinToString(", ")
+                r.added.isNotEmpty() -> "Added " + r.added.size + ". Problem: " + r.problems.first()
+                r.problems.isNotEmpty() -> r.problems.first()
+                else -> "Nothing was added"
             }
         }
     }
 
-    private fun fetchRepos(token: String): List<String> {
-        val r = Http.call(
-            "GET",
-            "https://api.github.com/user/repos?sort=pushed&per_page=50",
-            mapOf("Authorization" to "Bearer $token", "Accept" to "application/vnd.github+json", "X-GitHub-Api-Version" to "2022-11-28"),
-            null,
-            "api.github.com",
-        )
-        if (r.code !in 200..299) return emptyList()
-        val arr = JSONArray(r.body)
-        return (0 until arr.length()).map { arr.getJSONObject(it).optString("full_name") }
+    fun setSkillEnabled(s: Skill, on: Boolean) {
+        skills.setEnabled(s.id, on)
+        refreshSkills()
+    }
+
+    fun deleteSkill(s: Skill) {
+        skills.delete(s.id)
+        refreshSkills()
+    }
+
+    // ---------- on-device models ----------
+
+    fun refreshModels() {
+        models = LocalModels.list(getApplication()).map { it.name to it.length() }
+        if (cfg.localModel.isBlank() && models.isNotEmpty()) {
+            cfg = cfg.copy(localModel = models[0].first)
+            cfgStore.save(cfg)
+        }
+    }
+
+    fun downloadModel(m: CatalogModel) {
+        if (dlJob?.isActive == true) return
+        dlName = m.label
+        dlFraction = null
+        dlJob = viewModelScope.launch {
+            try {
+                LocalModels.download(getApplication(), m.url, m.file) { f, _ -> main.post { dlFraction = f } }
+                toast = "Model ready: " + m.label
+            } catch (e: CancellationException) {
+                toast = "Download paused. Tap Download to continue."
+                throw e
+            } catch (e: Exception) {
+                toast = e.message ?: "Download failed"
+            } finally {
+                dlName = null
+                dlFraction = null
+                refreshModels()
+            }
+        }
+    }
+
+    fun cancelDownload() {
+        dlJob?.cancel()
+    }
+
+    fun importModel(uri: Uri) {
+        if (dlJob?.isActive == true) return
+        dlName = "Importing"
+        dlFraction = null
+        dlJob = viewModelScope.launch {
+            try {
+                LocalModels.import(getApplication(), uri) { f -> main.post { dlFraction = f } }
+                toast = "Model imported"
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                toast = e.message ?: "Import failed"
+            } finally {
+                dlName = null
+                dlFraction = null
+                refreshModels()
+            }
+        }
+    }
+
+    fun deleteModel(name: String) {
+        LocalLlm.unload()
+        LocalModels.delete(getApplication(), name)
+        if (cfg.localModel == name) {
+            cfg = cfg.copy(localModel = "")
+            cfgStore.save(cfg)
+        }
+        refreshModels()
+    }
+
+    fun useModel(name: String) {
+        cfg = cfg.copy(localModel = name)
+        cfgStore.save(cfg)
     }
 
     // ---------- attachments ----------
@@ -183,9 +260,13 @@ class AgentEngine(app: Application) : AndroidViewModel(app) {
     fun send(raw: String): Boolean {
         val txt = raw.trim()
         if (txt.isEmpty() || busy) return false
-        if (cfg.key.isBlank()) {
-            toast = "Add your API key in Settings first"
+        if (cfg.mode == MODE_CLOUD && cfg.key.isBlank()) {
+            toast = "Add your API key in Settings, or switch to the on-device model"
             settingsRequest++
+            return false
+        }
+        if (cfg.mode == MODE_DEVICE && LocalModels.list(getApplication()).isEmpty()) {
+            toast = "Download or import a model first (menu > Models)"
             return false
         }
         val chat = cur ?: return false
@@ -196,7 +277,10 @@ class AgentEngine(app: Application) : AndroidViewModel(app) {
         }
         files.clear()
         chat.ui.add(Me(txt))
-        chat.hist.add(JSONObject().put("role", "user").put("content", txt + at))
+        // A hint for the model only (not shown in the chat): which skills look close to this request.
+        val near = skills.match(txt, 2).map { it.name }
+        val hint = if (near.isEmpty()) "" else "\n\n[Hint: these skills may fit this request: " + near.joinToString(", ") + ". Read the closest one with read_skill before you work.]"
+        chat.hist.add(JSONObject().put("role", "user").put("content", txt + at + hint))
         if (chat.title == "New chat") chat.title = txt.take(30)
         busy = true
         stopRequested = false
@@ -224,16 +308,30 @@ class AgentEngine(app: Application) : AndroidViewModel(app) {
     }
 
     private suspend fun loop(chat: Chat) {
-        for (step in 0 until 14) {
+        val device = cfg.mode == MODE_DEVICE
+        for (step in 0 until 16) {
             val bubble = Ai("")
             chat.ui.add(bubble)
-            val res = client.complete(cfg, chat.hist, AgentToolDefs.ALL) { partial ->
-                main.post { bubble.text = partial }
+            val tools = AgentToolDefs.build(cfg)
+            val system = AgentPrompt.system(cfg, skills, tools, device)
+            val show: (String) -> Unit = { raw ->
+                main.post {
+                    val parts = ThinkSplit.split(raw)
+                    bubble.think = parts.first
+                    bubble.text = parts.second
+                }
             }
-            bubble.text = res.text
-            if (res.text.isBlank()) chat.ui.remove(bubble)
+            val res = if (device) {
+                localClient.complete(cfg, system, chat.hist, show)
+            } else {
+                client.complete(cfg, system, chat.hist, tools, show)
+            }
+            val parts = ThinkSplit.split(res.text)
+            bubble.think = parts.first
+            bubble.text = parts.second
+            if (bubble.text.isBlank() && bubble.think.isBlank()) chat.ui.remove(bubble)
 
-            val m = JSONObject().put("role", "assistant").put("content", if (res.text.isEmpty()) JSONObject.NULL else res.text)
+            val m = JSONObject().put("role", "assistant").put("content", if (bubble.text.isEmpty()) JSONObject.NULL else bubble.text)
             if (res.calls.isNotEmpty()) {
                 val arr = JSONArray()
                 for (c in res.calls) {
@@ -267,7 +365,7 @@ class AgentEngine(app: Application) : AndroidViewModel(app) {
         card.status = "Running"
         card.kind = "warn"
         return try {
-            val out = AgentTools(cfg, getApplication()).run(c.name, a, card) { cd, need -> ask(cd, need) }
+            val out = AgentTools(cfg, getApplication(), skills).run(c.name, a, card) { cd, need -> ask(cd, need) }
             if (card.status != "Denied") {
                 card.status = "Done"
                 card.kind = "ok"
@@ -328,6 +426,7 @@ class AgentEngine(app: Application) : AndroidViewModel(app) {
             }
         }
         client.cancelRequest()
+        localClient.cancel()
         job?.cancel()
     }
 
@@ -358,6 +457,39 @@ class AgentEngine(app: Application) : AndroidViewModel(app) {
             } else {
                 i++
             }
+        }
+    }
+
+    // ---------- Run button on code blocks ----------
+
+    class SnippetResult(val output: String, val ok: Boolean)
+
+    /** Runs a code block from the chat in the real terminal. The user pressed Run, so no extra question. */
+    suspend fun runSnippet(lang: String, code: String): SnippetResult {
+        val app = getApplication<Application>()
+        val (ext, runner) = when (lang.lowercase()) {
+            "bash", "sh", "shell", "zsh", "console" -> "sh" to "bash"
+            "python", "py", "python3" -> "py" to "python3"
+            "javascript", "js", "node" -> "js" to "node"
+            else -> return SnippetResult("Run is not available for \"$lang\".", false)
+        }
+        if (!TerminalEngine.isInstalled(app)) {
+            return SnippetResult("The terminal is not set up yet. Open Terminal from the menu once, then press Run again.", false)
+        }
+        val dir = File(app.filesDir, "project/.run")
+        val name = "run_" + System.currentTimeMillis() + "." + ext
+        withContext(Dispatchers.IO) {
+            dir.mkdirs()
+            File(dir, name).writeText(code)
+        }
+        return try {
+            val r = TerminalEngine.exec(app, "cd /root/project && $runner .run/$name", 300)
+            val text = r.output.trim().ifEmpty { "(no output)" }
+            SnippetResult(text + "\n[" + (if (r.timedOut) "stopped: time limit" else "exit " + r.exit) + "]", !r.timedOut && r.exit == 0)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            SnippetResult("Could not run: " + (e.message ?: e.toString()), false)
         }
     }
 

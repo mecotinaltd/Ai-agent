@@ -12,9 +12,16 @@ android {
         applicationId = "com.collabcode.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 6
-        versionName = "0.6.0"
+        versionCode = 10
+        versionName = "1.0.0"
         ndk { abiFilters += listOf("arm64-v8a") }
+        externalNativeBuild {
+            cmake {
+                // llama.cpp is compiled for the phone's CPU. Use -PllamaArch=armv8-a for very old phones.
+                val arch = (project.findProperty("llamaArch") as String?) ?: "armv8.2-a+dotprod"
+                arguments += listOf("-DGGML_CPU_ARM_ARCH=$arch")
+            }
+        }
     }
 
     buildTypes {
@@ -28,6 +35,14 @@ android {
     kotlinOptions { jvmTarget = "17" }
 
     buildFeatures { compose = true }
+
+    ndkVersion = "26.1.10909125"
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
 
     packaging {
         // proot is started from the native library folder, so the libraries must be unpacked there.

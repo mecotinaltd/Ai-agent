@@ -57,6 +57,9 @@ object Proot {
             "LANG=C.UTF-8",
             "TMPDIR=/tmp",
             "DEBIAN_FRONTEND=noninteractive",
+            "PIP_BREAK_SYSTEM_PACKAGES=1",
+            "PIP_ROOT_USER_ACTION=ignore",
+            "PYTHONUNBUFFERED=1",
         )
         cmd += guestCommand
         return cmd

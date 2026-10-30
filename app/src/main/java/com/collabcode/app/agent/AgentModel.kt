@@ -16,12 +16,35 @@ class ToolCard(val title: String, val sub: String) {
     var kind by mutableStateOf("warn")
     var pending by mutableStateOf(false)
     var decision: CompletableDeferred<Boolean>? = null
+    /** A file the agent handed over (deliver_file). Empty when there is none. */
+    var file by mutableStateOf("")
 }
 
 sealed interface Ui
 class Me(val text: String) : Ui
 class Ai(text: String) : Ui {
     var text by mutableStateOf(text)
+    /** The model's visible reasoning (chain of thought), shown in a collapsible block. */
+    var think by mutableStateOf("")
+}
+
+/** Splits streamed text into reasoning (inside <think>...</think>) and the answer. */
+object ThinkSplit {
+    fun split(raw: String): Pair<String, String> {
+        val open = raw.indexOf("<think>")
+        if (open < 0) {
+            val close = raw.indexOf("</think>")
+            return if (close < 0) "" to raw.trimStart() else raw.substring(0, close).trim() to raw.substring(close + 8).trimStart()
+        }
+        val before = raw.substring(0, open)
+        val rest = raw.substring(open + 7)
+        val close = rest.indexOf("</think>")
+        return if (close < 0) {
+            rest.trim() to before.trimStart()
+        } else {
+            rest.substring(0, close).trim() to (before + rest.substring(close + 8)).trimStart()
+        }
+    }
 }
 class Note(val text: String) : Ui
 class ToolItem(val card: ToolCard) : Ui
@@ -50,13 +73,14 @@ class AgentStore(ctx: android.content.Context) {
                     val x = u.getJSONObject(k)
                     when (x.optString("r")) {
                         "me" -> chat.ui.add(Me(x.optString("t")))
-                        "ai" -> chat.ui.add(Ai(x.optString("t")))
+                        "ai" -> chat.ui.add(Ai(x.optString("t")).also { it.think = x.optString("k") })
                         "note" -> chat.ui.add(Note(x.optString("t")))
                         "tool" -> {
                             val card = ToolCard(x.optString("title"), x.optString("sub"))
                             card.out = x.optString("out")
                             card.status = x.optString("status", "Done")
                             card.kind = x.optString("kind", "ok")
+                            card.file = x.optString("file")
                             if (card.status == "Running" || card.status == "Needs approval") {
                                 card.status = "Stopped"
                                 card.kind = "err"
@@ -82,7 +106,7 @@ class AgentStore(ctx: android.content.Context) {
             for (item in c.ui) {
                 when (item) {
                     is Me -> u.put(JSONObject().put("r", "me").put("t", item.text))
-                    is Ai -> u.put(JSONObject().put("r", "ai").put("t", item.text))
+                    is Ai -> u.put(JSONObject().put("r", "ai").put("t", item.text).put("k", item.think))
                     is Note -> u.put(JSONObject().put("r", "note").put("t", item.text))
                     is ToolItem -> u.put(
                         JSONObject()
@@ -92,6 +116,7 @@ class AgentStore(ctx: android.content.Context) {
                             .put("out", item.card.out)
                             .put("status", item.card.status)
                             .put("kind", item.card.kind)
+                            .put("file", item.card.file)
                     )
                 }
             }
