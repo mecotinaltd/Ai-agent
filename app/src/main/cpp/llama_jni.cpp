@@ -112,7 +112,13 @@ Java_com_collabcode_app_agent_LlamaBridge_nativeGenerate(
     jfloat temp, jfloat top_p, jint top_k, jfloat repeat_penalty, jfloat presence_penalty,
     jfloat frequency_penalty, jint seed, jobject sink) {
     auto *e = reinterpret_cast<Engine *>(handle);
-    if (!e || !e->model) return ERR_CONTEXT;
+    if (!e || !e->model || !sink) return ERR_CONTEXT;
+    jclass sink_cls = env->GetObjectClass(sink);
+    jmethodID on_piece = sink_cls ? env->GetMethodID(sink_cls, "onPiece", "([B)Z") : nullptr;
+    if (!on_piece) {
+        env->ExceptionClear();
+        return ERR_CONTEXT;
+    }
     std::lock_guard<std::mutex> lock(e->run_mutex);
     e->stop.store(false);
 
@@ -193,8 +199,6 @@ Java_com_collabcode_app_agent_LlamaBridge_nativeGenerate(
     }
 
     // 6. Generate. Bytes are held back until they form complete UTF-8 characters.
-    jclass sink_cls = env->GetObjectClass(sink);
-    jmethodID on_piece = env->GetMethodID(sink_cls, "onPiece", "([B)Z");
     std::string pending;
     bool keep_going = true;
     int produced = 0;

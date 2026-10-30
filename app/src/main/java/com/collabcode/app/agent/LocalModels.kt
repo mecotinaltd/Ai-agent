@@ -171,49 +171,66 @@ object LocalModels {
         }
 }
 
-/** Keeps one model loaded in memory and runs requests on it. */
+/**
+ * Keeps one model loaded in memory and runs requests on it.
+ *
+ * Threading rule: the native handle is freed only while [freeLock] is held, and
+ * [handle] is set to 0 in the same lock. stop() and generate() read the handle
+ * under that lock, so they can never touch a freed model (that was a crash:
+ * the app closed when a chat request raced with a model reload or unload).
+ */
 object LocalLlm {
-    private var handle = 0L
+    private val freeLock = Any()
+    @Volatile private var handle = 0L
     private var loadedKey = ""
 
     val isLoaded: Boolean get() = handle != 0L
 
-    @Synchronized
     fun ensureLoaded(ctx: Context, cfg: AgentConfig): String? {
         if (!LlamaBridge.available) return "The on-device engine is not part of this build."
         val file = LocalModels.resolve(ctx, cfg.localModel) ?: return "No model on the phone yet. Open Models to download or import one."
         val key = "${file.path}|${cfg.nCtx}|${cfg.threads}"
-        if (handle != 0L && key == loadedKey) return null
-        if (handle != 0L) {
-            LlamaBridge.nativeFree(handle)
-            handle = 0L
+        synchronized(freeLock) {
+            if (handle != 0L && key == loadedKey) return null
+            freeLocked()
+            val h = LlamaBridge.nativeLoad(file.path, cfg.nCtx, cfg.threads)
+            if (h == 0L) return "The model could not be loaded. The file may be damaged, or the phone has too little free memory."
+            handle = h
+            loadedKey = key
+            return null
         }
-        val h = LlamaBridge.nativeLoad(file.path, cfg.nCtx, cfg.threads)
-        if (h == 0L) return "The model could not be loaded. The file may be damaged, or the phone has too little free memory."
-        handle = h
-        loadedKey = key
-        return null
     }
 
+    /**
+     * Stop is handled by the sink: LocalClient's sink returns false once cancelled, and llama.cpp
+     * stops at the next token. Calling into native code from another thread here would race with
+     * unload and could touch freed memory, so this does nothing.
+     */
     fun stop() {
-        val h = handle
-        if (h != 0L) LlamaBridge.nativeStop(h)
+        // intentionally empty
     }
 
-    @Synchronized
     fun unload() {
-        if (handle != 0L) LlamaBridge.nativeFree(handle)
+        synchronized(freeLock) { freeLocked() }
+    }
+
+    private fun freeLocked() {
+        val h = handle
         handle = 0L
         loadedKey = ""
+        if (h != 0L) LlamaBridge.nativeFree(h)
     }
 
     fun generate(cfg: AgentConfig, roles: List<String>, contents: List<String>, maxTokens: Int, sink: PieceSink): Int {
-        val h = handle
-        if (h == 0L) return -3
-        return LlamaBridge.nativeGenerate(
-            h, roles.toTypedArray(), contents.toTypedArray(), maxTokens,
-            cfg.temp.toFloat(), cfg.topP.toFloat(), cfg.topK, cfg.repeatPenalty.toFloat(),
-            cfg.presencePenalty.toFloat(), cfg.frequencyPenalty.toFloat(), cfg.seed, sink,
-        )
+        // Hold the lock for the whole generation so a reload/unload waits for it to finish.
+        synchronized(freeLock) {
+            val h = handle
+            if (h == 0L) return -3
+            return LlamaBridge.nativeGenerate(
+                h, roles.toTypedArray(), contents.toTypedArray(), maxTokens,
+                cfg.temp.toFloat(), cfg.topP.toFloat(), cfg.topK, cfg.repeatPenalty.toFloat(),
+                cfg.presencePenalty.toFloat(), cfg.frequencyPenalty.toFloat(), cfg.seed, sink,
+            )
+        }
     }
 }

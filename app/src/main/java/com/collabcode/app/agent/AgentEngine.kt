@@ -202,13 +202,17 @@ class AgentEngine(app: Application) : AndroidViewModel(app) {
     }
 
     fun deleteModel(name: String) {
-        LocalLlm.unload()
-        LocalModels.delete(getApplication(), name)
+        val app = getApplication<Application>()
+        // unload() can wait for a reply that is still running, so it must not run on the UI thread.
+        viewModelScope.launch(Dispatchers.IO) {
+            LocalLlm.unload()
+            LocalModels.delete(app, name)
+            withContext(Dispatchers.Main) { refreshModels() }
+        }
         if (cfg.localModel == name) {
             cfg = cfg.copy(localModel = "")
             cfgStore.save(cfg)
         }
-        refreshModels()
     }
 
     fun useModel(name: String) {

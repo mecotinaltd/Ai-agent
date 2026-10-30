@@ -12,8 +12,8 @@ android {
         applicationId = "com.collabcode.app"
         minSdk = 26
         targetSdk = 34
-        versionCode = 10
-        versionName = "1.0.0"
+        versionCode = 11
+        versionName = "1.0.2"
         ndk { abiFilters += listOf("arm64-v8a") }
         externalNativeBuild {
             cmake {
